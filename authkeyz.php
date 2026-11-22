@@ -246,11 +246,15 @@ class api
             return $json->response;
     }
 
+    public $public_key = "8e8d104f3ce9b29b411cfcf8e049d19fed42e63caa275e111bfa71ef3d237041";
+
     private function req($data)
     {
         $curl = curl_init("https://authkeyz.bond/api/1.3/");
         curl_setopt($curl, CURLOPT_USERAGENT, "AuthKeyz");
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_HEADER, true);
+        curl_setopt($curl, CURLOPT_TIMEOUT, 20);
 
         curl_setopt($curl, CURLOPT_POST, 1);
         curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, false);
@@ -260,9 +264,81 @@ class api
 
         $response = curl_exec($curl);
 
+        $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        if ($http_code == 429) {
+            die("You're connecting too faster to loader, slow down");
+        }
+
+        $header_size = curl_getinfo($curl, CURLINFO_HEADER_SIZE);
+        $header_str = substr($response, 0, $header_size);
+        $body = substr($response, $header_size);
+
         curl_close($curl);
 
-        return $response;
+        $headers = array();
+        foreach (explode("\r\n", $header_str) as $line) {
+            $parts = explode(': ', $line, 2);
+            if (isset($parts[1])) {
+                $headers[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+        }
+
+        $this->sigCheck($body, $headers, $data['type']);
+
+        $json = json_decode($body);
+        if ($json && isset($json->ownerid) && $json->ownerid != $this->OwnerId) {
+            die("Application mismatch. Terminating process.");
+        }
+
+        return $body;
+    }
+
+    private function sigCheck(string $resp, array $headers, string $type): void
+    {
+        $skipTypes = ['log', 'file', '2faenable', '2fadisable'];
+        if (in_array($type, $skipTypes, true)) {
+            return;
+        }
+
+        $signatureHeader = $headers['x-signature-ed25519'] ?? null;
+        $timestampHeader = $headers['x-signature-timestamp'] ?? null;
+
+        // 1. Asymmetric Ed25519 Verification (AuthKeyz API 1.3 Master Protocol)
+        if (!empty($signatureHeader) && !empty($timestampHeader)) {
+            if (!extension_loaded('sodium')) {
+                die("The 'sodium' extension is required.");
+            }
+
+            if (!ctype_digit((string)$timestampHeader)) {
+                $this->failSignatureCheck();
+            }
+
+            $timestamp = (int) $timestampHeader;
+            if (abs(time() - $timestamp) > 300) {
+                throw new \RuntimeException("Clock skew too large or request expired.");
+            }
+
+            $publicKeyHex = $this->public_key ?: '8e8d104f3ce9b29b411cfcf8e049d19fed42e63caa275e111bfa71ef3d237041';
+            $signedMessage = (string)$timestampHeader . $resp;
+
+            try {
+                $signature = sodium_hex2bin($signatureHeader);
+                $publicKey = sodium_hex2bin($publicKeyHex);
+
+                if (!sodium_crypto_sign_verify_detached($signature, $signedMessage, $publicKey)) {
+                    $this->failSignatureCheck();
+                }
+                return;
+            } catch (\Throwable $e) {
+                $this->failSignatureCheck();
+            }
+        }
+    }
+
+    private function failSignatureCheck(): void
+    {
+        http_response_code(401);
+        exit('Signature verification failed.');
     }
 
     public function error($msg)
